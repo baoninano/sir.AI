@@ -18,38 +18,27 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain.memory import ConversationBufferMemory
 
-# --- 環境設定 ---
 load_dotenv()
 app = FastAPI()
 router = APIRouter()
 
-# --- ツール定義 ---
 @tool
 async def send_http_request(url: str, method: str, data: str = None, headers: dict = None) -> str:
-    """
-    指定されたURLに非同期でHTTPリクエストを送信し、レスポンスと脆弱性パターン検知フラグを返す。
-    """
     async with httpx.AsyncClient() as client:
         try:
             response = await client.request(method, url, data=data, headers=headers, timeout=15)
             
             vulnerability_flags = []
             
-            # SQLインジェクション
             if re.search(r"sql syntax|mysql|query error|fatal error", response.text, re.IGNORECASE):
                 vulnerability_flags.append("SQL_ERROR_DETECTED")
             
-            # XSS
             if re.search(r"<script>alert\(|javascript:alert\(", response.text, re.IGNORECASE):
                 vulnerability_flags.append("XSS_PAYLOAD_ECHOED")
             
-            # Path Traversal
-            # Windowsの場合のパス、Linuxの場合のパスを検出
             if re.search(r"root:[xX]:0:0:|c:\\windows|etc/passwd|/etc/passwd", response.text, re.IGNORECASE):
                 vulnerability_flags.append("PATH_TRAVERSAL_CONTENT_DETECTED")
 
-            # SSRF
-            # 内部IPアドレス（10.x.x.x, 172.16-31.x.x, 192.168.x.x）のレスポンスを検知
             if re.search(r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}", response.text):
                 vulnerability_flags.append("SSRF_INTERNAL_IP_DETECTED")
 
@@ -67,9 +56,6 @@ async def send_http_request(url: str, method: str, data: str = None, headers: di
 
 @tool
 async def detect_waf(url: str) -> str:
-    """
-    指定されたURLに非同期でリクエストを送信し、WAFの痕跡を検出する。
-    """
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, timeout=10)
@@ -84,7 +70,6 @@ async def detect_waf(url: str) -> str:
         except httpx.RequestError as e:
             return f"WAF detection error: {e}"
 
-# --- Pydantic モデル定義 ---
 class TechStackItem(BaseModel):
     name: str
     version: Optional[str] = None
@@ -95,7 +80,6 @@ class ScanInput(BaseModel):
     tech_stack: List[TechStackItem]
     vulnerability_types: Optional[List[str]] = ["xss", "sql_injection", "path_traversal", "ssrf"]
 
-# --- APIエンドポイント ---
 @router.post("/start_scan")
 async def start_scan(scan_input: ScanInput):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
@@ -141,7 +125,6 @@ async def start_scan(scan_input: ScanInput):
         print(f"An error occurred during agent execution: {e}")
         return {"status": "error", "final_report": f"診断中にエラーが発生しました: {e}"}
 
-# --- フロントエンド提供 ---
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     html_content = """
@@ -262,7 +245,6 @@ async def serve_frontend():
     """
     return HTMLResponse(content=html_content)
 
-# --- FastAPI ルーティング ---
 app.include_router(router, prefix="/api/v1")
 
 if __name__ == "__main__":
