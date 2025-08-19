@@ -18,27 +18,38 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain.memory import ConversationBufferMemory
 
+# --- 環境設定 ---
 load_dotenv()
 app = FastAPI()
 router = APIRouter()
 
+# --- ツール定義 ---
 @tool
 async def send_http_request(url: str, method: str, data: str = None, headers: dict = None) -> str:
+    """
+    指定されたURLに非同期でHTTPリクエストを送信し、レスポンスと脆弱性パターン検知フラグを返す。
+    """
     async with httpx.AsyncClient() as client:
         try:
             response = await client.request(method, url, data=data, headers=headers, timeout=15)
             
             vulnerability_flags = []
             
+            # SQLインジェクション
             if re.search(r"sql syntax|mysql|query error|fatal error", response.text, re.IGNORECASE):
                 vulnerability_flags.append("SQL_ERROR_DETECTED")
             
+            # XSS
             if re.search(r"<script>alert\(|javascript:alert\(", response.text, re.IGNORECASE):
                 vulnerability_flags.append("XSS_PAYLOAD_ECHOED")
             
+            # Path Traversal
+            # Windowsの場合のパス、Linuxの場合のパスを検出
             if re.search(r"root:[xX]:0:0:|c:\\windows|etc/passwd|/etc/passwd", response.text, re.IGNORECASE):
                 vulnerability_flags.append("PATH_TRAVERSAL_CONTENT_DETECTED")
 
+            # SSRF
+            # 内部IPアドレス（10.x.x.x, 172.16-31.x.x, 192.168.x.x）のレスポンスを検知
             if re.search(r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}", response.text):
                 vulnerability_flags.append("SSRF_INTERNAL_IP_DETECTED")
 
@@ -56,6 +67,9 @@ async def send_http_request(url: str, method: str, data: str = None, headers: di
 
 @tool
 async def detect_waf(url: str) -> str:
+    """
+    指定されたURLに非同期でリクエストを送信し、WAFの痕跡を検出する。
+    """
     async with httpx.AsyncClient() as client:
         try:
             response = await client.get(url, timeout=10)
@@ -70,6 +84,7 @@ async def detect_waf(url: str) -> str:
         except httpx.RequestError as e:
             return f"WAF detection error: {e}"
 
+# --- Pydantic モデル定義 ---
 class TechStackItem(BaseModel):
     name: str
     version: Optional[str] = None
@@ -80,6 +95,7 @@ class ScanInput(BaseModel):
     tech_stack: List[TechStackItem]
     vulnerability_types: Optional[List[str]] = ["xss", "sql_injection", "path_traversal", "ssrf"]
 
+# --- APIエンドポイント ---
 @router.post("/start_scan")
 async def start_scan(scan_input: ScanInput):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
@@ -125,6 +141,7 @@ async def start_scan(scan_input: ScanInput):
         print(f"An error occurred during agent execution: {e}")
         return {"status": "error", "final_report": f"診断中にエラーが発生しました: {e}"}
 
+# --- フロントエンド提供 ---
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
     html_content = """
@@ -157,7 +174,7 @@ async def serve_frontend():
             <input type="text" id="endpoint" placeholder="例: /contact-form" required>
 
             <label for="tech_stack">Wappalyzer結果 (CSV形式):</label>
-            <textarea id="tech_stack" rows="10" placeholder='ここにWappalyzerの結果を貼り付けてください。ヘッダー行とデータ行を含むCSV形式でお願いします。\n例: \n"URL","JavaScriptフレームワーク","Webサーバー"\n"https://example.com","React","Apache HTTP Server"'></textarea>
+            <textarea id="tech_stack" rows="10" placeholder='ここにWappalyzerの結果を貼り付けてください。ヘッダー行とデータ行を含むCSV形式でお願いします。\n例: \n"URL","JavaScript frameworks","Web servers"\n"https://example.com","React","Apache HTTP Server"'></textarea>
 
             <button onclick="startScan()">スキャン開始</button>
 
@@ -192,14 +209,14 @@ async def serve_frontend():
                         throw new Error("CSVにはヘッダー行とデータ行が必要です。");
                     }
 
-                    const headers = lines[0].split(',').map(h => h.trim().replace(/\"/g, ''));
-                    const data = lines[1].split(',').map(d => d.trim().replace(/\"/g, ''));
+                    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+                    const data = lines[1].split(',').map(d => d.trim().replace(/^"|"$/g, ''));
 
                     for (let i = 0; i < headers.length; i++) {
                         if (data[i] && data[i] !== '') {
-                            const techNames = data[i].split(';');
+                            const techNames = data[i].split(';').map(t => t.trim());
                             techNames.forEach(techName => {
-                                const [name, version] = techName.trim().split(' ').map(s => s.trim());
+                                const [name, version] = techName.split(' ').map(s => s.trim());
                                 techStackData.push({
                                     name: name,
                                     version: version || null
@@ -220,7 +237,7 @@ async def serve_frontend():
                 };
 
                 try {
-                    const response = await fetch('/api/v1/start_scan', {
+                    const response = await fetch('/start_scan', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(data)
@@ -245,7 +262,8 @@ async def serve_frontend():
     """
     return HTMLResponse(content=html_content)
 
-app.include_router(router, prefix="/api/v1")
+# --- FastAPI ルーティング ---
+app.include_router(router)
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
