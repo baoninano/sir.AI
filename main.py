@@ -141,6 +141,11 @@ async def start_scan(scan_input: ScanInput):
         print(f"An error occurred during agent execution: {e}")
         return {"status": "error", "final_report": f"診断中にエラーが発生しました: {e}"}
 
+# --- ヘルスチェックエンドポイントの追加 ---
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
+
 # --- フロントエンド提供 ---
 @app.get("/", response_class=HTMLResponse)
 async def serve_frontend():
