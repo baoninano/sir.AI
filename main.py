@@ -6,7 +6,6 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
 import asyncio
-import requests
 import httpx
 import json
 import re
@@ -44,12 +43,10 @@ async def send_http_request(url: str, method: str, data: str = None, headers: di
                 vulnerability_flags.append("XSS_PAYLOAD_ECHOED")
             
             # Path Traversal
-            # Windowsの場合のパス、Linuxの場合のパスを検出
             if re.search(r"root:[xX]:0:0:|c:\\windows|etc/passwd|/etc/passwd", response.text, re.IGNORECASE):
                 vulnerability_flags.append("PATH_TRAVERSAL_CONTENT_DETECTED")
 
             # SSRF
-            # 内部IPアドレス（10.x.x.x, 172.16-31.x.x, 192.168.x.x）のレスポンスを検知
             if re.search(r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}", response.text):
                 vulnerability_flags.append("SSRF_INTERNAL_IP_DETECTED")
 
@@ -101,7 +98,7 @@ async def start_scan(scan_input: ScanInput):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
     
     tools = [send_http_request, detect_waf]
-    memory = ConversationBufferMemory(memory_key="chat_history")
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True) # return_messages=Trueを追加
     
     agent_prompt = ChatPromptTemplate.from_messages([
         ("system", "あなたはバグバウンティの専門家であり、高度なウェブ脆弱性スキャナーです。"),
@@ -132,9 +129,12 @@ async def start_scan(scan_input: ScanInput):
     """
     
     try:
-        result = await agent_executor.ainvoke({"input": initial_input})
-        final_report = result.get('output', '診断中に予期せぬエラーが発生しました。')
+        # 初回実行時、チャット履歴は空のリストでOK
+        result = await agent_executor.ainvoke({
+            "input": initial_input
+        })
         
+        final_report = result.get('output', '診断中に予期せぬエラーが発生しました。')
         return {"status": "scanning_complete", "final_report": final_report}
         
     except Exception as e:
