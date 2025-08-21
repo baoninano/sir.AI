@@ -23,7 +23,7 @@ from langchain.memory import ConversationBufferMemory
 # --- FastAPIとAPIRouterのインスタンスを生成 ---
 load_dotenv()
 app = FastAPI()
-router = APouter()
+router = APRouter()
 
 # --- WAFバイパス手法を適用するヘルパー関数 ---
 def apply_waf_bypass(payload: str, bypass_technique: str) -> str:
