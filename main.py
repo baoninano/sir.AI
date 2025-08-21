@@ -18,14 +18,25 @@ from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain.memory import ConversationBufferMemory
-from google_search import search as google_search_tool # google_searchツールのインポート
+# --- 修正箇所: 適切なGoogle Searchツールをインポート ---
+# 公式のLangChain Google Searchツールをインポートする場合
+# from langchain_community.tools import GoogleSearchRun
+# from langchain_community.utilities import GoogleSearchAPIWrapper
 
-# --- 環境設定 ---
-load_dotenv()
-app = FastAPI()
-router = APIRouter()
+# 例として、カスタムのダミー検索ツールを定義
+@tool
+def google_search(queries: List[str]) -> List[dict]:
+    """指定されたクエリでGoogle検索を実行する。"""
+    # 実際にはここでGoogle Search APIなどを呼び出す
+    print(f"Executing Google Search for queries: {queries}")
+    # ダミーの結果を返す
+    dummy_results = [
+        {"title": "CVE-2023-1234 WordPress Plugin XSS", "url": "https://example.com/cve", "snippet": "A reflected XSS vulnerability was found in a WordPress plugin."},
+        {"title": "How to fix Apache 2.4.46 vulnerability", "url": "https://example.com/fix", "snippet": "A guide to patching critical vulnerabilities in Apache."},
+    ]
+    return dummy_results
 
-# --- 脆弱性ペイロードリストとファジング関数 ---
+# --- 脆弱性ペイロードリストとファジング関数は省略（前回のコードと同じ） ---
 def generate_xss_payloads(num_payloads: int = 5) -> List[str]:
     """
     ランダムなXSSペイロードを生成
@@ -100,11 +111,11 @@ async def search_cve_by_tech_stack(tech_stack: List[Dict]) -> str:
             print(f"Searching for CVEs with query: '{query}'")
             
             try:
-                search_results = await google_search_tool(queries=[query])
+                search_results = await google_search(queries=[query])
                 result_text = ""
-                if search_results and search_results[0].results:
-                    for res in search_results[0].results:
-                        result_text += f"Title: {res.source_title}\nURL: {res.url}\nSnippet: {res.snippet}\n\n"
+                if search_results and search_results[0].get('results'):
+                    for res in search_results[0]['results']:
+                        result_text += f"Title: {res.get('source_title')}\nURL: {res.get('url')}\nSnippet: {res.get('snippet')}\n\n"
                 else:
                     result_text = f"No search results found for {name}."
                 cve_results.append(f"--- CVE Search for {name} ({version}) ---\n{result_text}")
@@ -120,17 +131,14 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
     """
     async with httpx.AsyncClient() as client:
         try:
-            # 正常なレスポンスを取得して差分比較の基準とする
             normal_response = await client.request(method, url, timeout=15)
             
-            # ペイロードを挿入してリクエストを送信
             start_time = time.time()
             response = await client.request(method, url, data=data, headers=headers, timeout=15)
             elapsed_time = time.time() - start_time
             
             vulnerability_flags = []
             
-            # --- SQLインジェクションの検出 ---
             if payload_type == "sqli":
                 sql_error_patterns = [
                     r"sql syntax", r"mysql", r"query error", r"unclosed quotation",
@@ -139,32 +147,25 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
                 if response.status_code == 500 or any(re.search(p, response.text, re.IGNORECASE) for p in sql_error_patterns):
                     vulnerability_flags.append("SQLI_ERROR_DETECTED")
                 
-                # ブーリアンベースSQLiの検出
                 if data and ("' AND 1=1--" in data or "' OR 1=1--" in data):
                     response_diff = abs(len(response.text) - len(normal_response.text))
-                    if response_diff < 100: # 応答サイズがほぼ同じ
+                    if response_diff < 100:
                         vulnerability_flags.append("SQLI_BOOLEAN_BASED_DETECTED")
 
-                # タイムベースの検出
                 if "sleep" in str(data) and elapsed_time > 4:
                     vulnerability_flags.append("SQLI_TIME_BASED_DETECTED")
             
-            # --- XSSの検出 ---
             if payload_type == "xss":
-                # 反射型XSSの検出
                 if data and str(data) in response.text:
                     vulnerability_flags.append("XSS_PAYLOAD_REFLECTED")
                 
-                # DOM-based XSSの検出 (JavaScript内での反射)
                 if re.search(r"var\s+\w+\s*=\s*['\"]" + re.escape(data) + r"['\"]", response.text) or \
                    re.search(r"document\.write\s*\(\s*['\"]" + re.escape(data) + r"['\"]", response.text):
                     vulnerability_flags.append("XSS_DOM_BASED_DETECTED")
                 
-                # 特定のイベントハンドラやタグの検出
                 if re.search(r"<img[^>]*onerror=|javascript:", response.text, re.IGNORECASE):
                     vulnerability_flags.append("XSS_EVENT_HANDLER_DETECTED")
 
-            # --- その他の脆弱性 ---
             if payload_type == "path_traversal":
                 if re.search(r"root:[xX]:0:0:|c:\\windows|etc/passwd|/etc/passwd", response.text, re.IGNORECASE):
                     vulnerability_flags.append("PATH_TRAVERSAL_CONTENT_DETECTED")
@@ -220,6 +221,7 @@ class ScanInput(BaseModel):
 async def start_scan(scan_input: ScanInput):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
     
+    # ツールにCVE検索ツールを追加
     tools = [send_http_request_with_payload, detect_waf, search_cve_by_tech_stack]
     memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     
