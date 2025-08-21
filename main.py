@@ -229,7 +229,7 @@ async def start_scan(scan_input: ScanInput):
         ("system", "攻撃ペイロードの生成、応答の分析、報告書の作成はすべてあなたの思考プロセスで行い、必要に応じて適切なツールを呼び出してください。"),
         ("system", "レスポンスの`Flags`に`XSS_PAYLOAD_REFLECTED`、`SQLI_ERROR_DETECTED`、`PATH_TRAVERSAL_CONTENT_DETECTED`、`RCE_COMMAND_OUTPUT_DETECTED`のいずれかが含まれていたら、脆弱性が存在すると判断し、詳細な報告書に含めてください。"),
         MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
+        ("human", "{input}"), # ここはそのまま
         MessagesPlaceholder("agent_scratchpad"),
     ])
     
@@ -266,10 +266,12 @@ async def start_scan(scan_input: ScanInput):
     """
     
     try:
+        # ここを修正
         result = await agent_executor.ainvoke({"input": initial_input})
         final_report = result.get('output', '診断中に予期せぬエラーが発生しました。')
         return {"status": "scanning_complete", "final_report": final_report}
     except Exception as e:
+        # エラーメッセージをより詳細に表示
         return {"status": "error", "final_report": f"診断中にエラーが発生しました: {e}"}
 
 # --- ヘルスチェックとフロントエンド (変更なし) ---
