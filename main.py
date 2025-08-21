@@ -23,7 +23,7 @@ from langchain.memory import ConversationBufferMemory
 # --- FastAPIとAPIRouterのインスタンスを生成 ---
 load_dotenv()
 app = FastAPI()
-router = APRouter()
+router = APIRouter() # ここをAPIRouterに修正
 
 # --- WAFバイパス手法を適用するヘルパー関数 ---
 def apply_waf_bypass(payload: str, bypass_technique: str) -> str:
@@ -236,13 +236,13 @@ async def start_scan(scan_input: ScanInput):
         memory=memory
     )
     
-    # --- 新規追加: すべてのペイロードを生成 ---
+    # --- すべてのペイロードを生成 ---
     all_xss_payloads = generate_xss_payloads()
     all_sqli_payloads = generate_sqli_payloads()
     all_lfi_payloads = generate_lfi_payloads()
     all_rce_payloads = generate_rce_payloads()
     
-    # --- 変更: プロンプトにすべてのペイロードリストを含める ---
+    # --- プロンプトにすべてのペイロードリストを含める ---
     tech_stack_str = ", ".join([f"{item.name} {item.version}" if item.version else item.name for item in scan_input.tech_stack]) if scan_input.tech_stack else "情報なし"
     
     initial_input = f"""
