@@ -23,7 +23,7 @@ from langchain.memory import ConversationBufferMemory
 # --- FastAPIとAPIRouterのインスタンスを生成 ---
 load_dotenv()
 app = FastAPI()
-router = APIRouter() # ここをAPIRouterに修正
+router = APIRouter()
 
 # --- WAFバイパス手法を適用するヘルパー関数 ---
 def apply_waf_bypass(payload: str, bypass_technique: str) -> str:
@@ -220,9 +220,14 @@ async def start_scan(scan_input: ScanInput):
     agent_prompt = ChatPromptTemplate.from_messages([
         ("system", "あなたはバグバウンティの専門家であり、高度なウェブ脆弱性スキャナーです。"),
         ("system", "ユーザーが提供する情報に基づき、段階的に脆弱性を検証してください。"),
-        ("system", "あなたの思考プロセスは以下のステップに従います: 1. `detect_waf`ツールでWAFの有無を調べる。2. その結果とユーザー入力に基づいて、最適な攻撃ペイロードを生成する。3. `send_http_request_with_payload`ツールでペイロードを試行する。このツールは、複数のWAFバイパス手法を自動的に試行します。4. 応答に含まれる**Flags**とレスポンス内容を分析し、脆弱性候補を判断する。5. 複数のペイロードでテストを繰り返す。6. 脆弱性が確認できたら、詳細な報告書を生成する。"),
+        ("system", "あなたの思考プロセスは以下のステップに従います:"),
+        ("system", "1. まず、`detect_waf`ツールを使用して、ターゲットURLにWAFが存在するかどうかを判断します。"),
+        ("system", "2. WAFの検出結果とユーザーの入力に基づいて、提供されたペイロードリストから脆弱性タイプごとにテストを開始します。"),
+        ("system", "3. `send_http_request_with_payload`ツールを使用して、各ペイロードをターゲットエンドポイントに送信します。**この時、`method`は'POST'、`payload_type`は該当する脆弱性タイプ（例: 'xss', 'sql_injection', 'path_traversal', 'rce'）、`data`はペイロードをキーと値のペアとして含むJSON文字列（例: '{\"query\":\"<script>alert(\\'XSS\\')</script>\"}'）を生成し、URLエンコードして使用します。**"),
+        ("system", "4. 各リクエストのレスポンスを注意深く分析し、脆弱性の兆候（Flags）を探します。"),
+        ("system", "5. すべての脆弱性タイプとすべてのペイロードを試行し終えたら、見つかった脆弱性の詳細と、見つからなかった場合はその旨をまとめた最終報告書を作成します。"),
         ("system", "攻撃ペイロードの生成、応答の分析、報告書の作成はすべてあなたの思考プロセスで行い、必要に応じて適切なツールを呼び出してください。"),
-        ("system", "特に、Path Traversalではペイロードとして`../`や`..\\`などを、SSRFでは`http://127.0.0.1`や`http://10.0.0.1`などを試行し、`Flags`の出力を注意深く観察してください。"),
+        ("system", "レスポンスの`Flags`に`XSS_PAYLOAD_REFLECTED`、`SQLI_ERROR_DETECTED`、`PATH_TRAVERSAL_CONTENT_DETECTED`、`RCE_COMMAND_OUTPUT_DETECTED`のいずれかが含まれていたら、脆弱性が存在すると判断し、詳細な報告書に含めてください。"),
         MessagesPlaceholder("chat_history"),
         ("human", "{input}"),
         MessagesPlaceholder("agent_scratchpad"),
