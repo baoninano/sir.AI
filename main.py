@@ -265,7 +265,7 @@ async def start_scan(scan_input: ScanInput):
     上記情報に基づき、脆弱性スキャンを開始してください。
     """
     try:
-        result = await agent_executor.ainvoke({"input": initial_input, "query": initial_input})
+        result = await agent_executor.ainvoke({"input": initial_input})
         final_report = result.get('output', '診断中に予期せぬエラーが発生しました。')
         return {"status": "scanning_complete", "final_report": final_report}
     except Exception as e:
