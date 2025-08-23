@@ -284,7 +284,7 @@ async def start_scan(scan_input: ScanInput):
     except Exception as e:
         return {"status": "error", "final_report": f"診断中にエラーが発生しました: {e}"}
 
-# --- ヘルスチェックとフロントエンド (変更なし) ---
+@app.head("/health")
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
