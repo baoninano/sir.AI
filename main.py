@@ -1144,8 +1144,8 @@ class TechStackItem(BaseModel):
     version: Optional[str] = None
 
 class ScanInput(BaseModel):
-    url: str = Field(...,.., description="Target base URL")
-    target_endpoint: str = Field(...,.., description="Target endpoint path") 
+    url: str = Field(..., description="Target base URL")
+    target_endpoint: str = Field(..., description="Target endpoint path") 
     tech_stack: Optional[List[TechStackItem]] = Field(None, description="Technology stack")
     vulnerability_types: List[str] = Field(
         default=["xss", "sql_injection", "lfi", "rce", "ssti"], 
@@ -1201,8 +1201,8 @@ async def start_comprehensive_scan(scan_input: ScanInput, background_tasks: Back
 
 @router.post("/quick_scan")
 async def quick_vulnerability_scan(
-    url: str = Field(...,.., description="Target URL"),
-    vulnerability_type: str = Field(...,.., description="Vulnerability type to test"),
+    url: str = Field(..., description="Target URL"),
+    vulnerability_type: str = Field(..., description="Vulnerability type to test"),
     method: str = Field(default="POST", description="HTTP method"),
     data: str = Field(default='{"q": "test"}', description="Request data as JSON string")
 ):
