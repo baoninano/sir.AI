@@ -1,7 +1,7 @@
 import os
 import uvicorn
 import logging
-from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks
+from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks, Header
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, validator
 from dotenv import load_dotenv
@@ -14,6 +14,45 @@ import json
 from urllib.parse import quote_plus, unquote
 from contextlib import asynccontextmanager
 import traceback
+import ipaddress
+import socket
+
+# --- Security helpers ---
+def _resolve_ip(host: str):
+    try:
+        infos = socket.getaddrinfo(host, None)
+        ips = {info[4][0] for info in infos}
+        return [ipaddress.ip_address(ip) for ip in ips]
+    except Exception:
+        return []
+
+def is_blocked_ip(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> bool:
+    # RFC1918, loopback, link-local, unique-local, multicast, unspecified + metadata ranges
+    private = ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified
+    # AWS/GCP metadata IPs
+    metadata_ips = {"169.254.169.254"}
+    return private or str(ip) in metadata_ips
+
+def validate_outbound_url(target_url: str) -> None:
+    from urllib.parse import urlparse
+    if not target_url or not target_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Invalid URL")
+    parsed = urlparse(target_url)
+    ips = _resolve_ip(parsed.hostname)
+    if not ips:
+        return
+    for ip in ips:
+        if is_blocked_ip(ip):
+            raise HTTPException(status_code=400, detail="Outbound to private/metadata addresses is blocked")
+
+def require_api_key(x_api_key: str | None) -> None:
+    required = os.getenv("API_KEY")
+    if not required:
+        # locked-down default: require key; if not set, block
+        raise HTTPException(status_code=503, detail="Server not configured: set API_KEY env var")
+    if x_api_key != required:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
 from datetime import datetime
 import base64
 import hashlib
@@ -679,10 +718,15 @@ async def get_http_client():
         timeout=timeout, 
         limits=limits,
         follow_redirects=True,
-        verify=False,
+        verify=True,
         http2=True  # HTTP/2サポート
     ) as client:
         yield client
+
+
+# Concurrency & limits
+_MAX_REQUESTS_PER_SCAN = int(os.getenv("MAX_REQUESTS_PER_SCAN", "200"))
+_concurrency_semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENCY", "10")))
 
 # --- 高度な脆弱性検出ツール ---
 @tool
@@ -699,6 +743,10 @@ async def advanced_vulnerability_scanner(
     """
     if not url or not url.startswith(('http://', 'https://')):
         return "Error: Invalid URL format"
+    try:
+        validate_outbound_url(url)
+    except HTTPException as e:
+        return f"Blocked URL: {e.detail}"
     
     # 高度なWAFバイパス手法
     bypass_techniques = [
@@ -737,10 +785,12 @@ async def advanced_vulnerability_scanner(
         async with get_http_client() as client:
             # ベースライン取得
             try:
+                t0 = time.monotonic()
                 baseline_response = await client.request(method.upper(), url, data=data_dict, headers=headers or {})
+                t1 = time.monotonic()
                 baseline_status = baseline_response.status_code
                 baseline_length = len(baseline_response.text)
-                baseline_time = baseline_response.elapsed.total_seconds()
+                baseline_time = t1 - t0
             except Exception as e:
                 return f"Baseline request failed: {e}"
             
@@ -986,12 +1036,13 @@ async def run_comprehensive_scan_and_analyze(scan_input: "ScanInput"):
         logger.info(f"\n{scan_results}")
         logger.info(f"[{scan_id}] =========================================")
         
+        # LLM分析（利用可能な場合）
         if config.google_api_key:
             try:
                 logger.info(f"[{scan_id}] Starting advanced LLM analysis...")
                 
                 llm = ChatGoogleGenerativeAI(
-                    model="gemini-2.5-flash", 
+                    model="gemini-1.5-flash", 
                     temperature=0.1,
                     google_api_key=config.google_api_key
                 )
@@ -1093,8 +1144,8 @@ class TechStackItem(BaseModel):
     version: Optional[str] = None
 
 class ScanInput(BaseModel):
-    url: str = Field(..., description="Target base URL")
-    target_endpoint: str = Field(..., description="Target endpoint path") 
+    url: str = Field(...,.., description="Target base URL")
+    target_endpoint: str = Field(...,.., description="Target endpoint path") 
     tech_stack: Optional[List[TechStackItem]] = Field(None, description="Technology stack")
     vulnerability_types: List[str] = Field(
         default=["xss", "sql_injection", "lfi", "rce", "ssti"], 
@@ -1150,12 +1201,15 @@ async def start_comprehensive_scan(scan_input: ScanInput, background_tasks: Back
 
 @router.post("/quick_scan")
 async def quick_vulnerability_scan(
-    url: str = Field(..., description="Target URL"),
-    vulnerability_type: str = Field(..., description="Vulnerability type to test"),
+    url: str = Field(...,.., description="Target URL"),
+    vulnerability_type: str = Field(...,.., description="Vulnerability type to test"),
     method: str = Field(default="POST", description="HTTP method"),
     data: str = Field(default='{"q": "test"}', description="Request data as JSON string")
 ):
     """クイック脆弱性スキャン - 単一の脆弱性タイプを即座にテスト"""
+    # Auth & URL guard
+    require_api_key(x_api_key)
+    validate_outbound_url(url)
     try:
         result = await advanced_vulnerability_scanner(
             url=url,
