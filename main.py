@@ -1,7 +1,7 @@
 import os
 import uvicorn
 import logging
-from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks, Header
+from fastapi import FastAPI, APIRouter, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field, validator
 from dotenv import load_dotenv
@@ -14,45 +14,6 @@ import json
 from urllib.parse import quote_plus, unquote
 from contextlib import asynccontextmanager
 import traceback
-import ipaddress
-import socket
-
-# --- Security helpers ---
-def _resolve_ip(host: str):
-    try:
-        infos = socket.getaddrinfo(host, None)
-        ips = {info[4][0] for info in infos}
-        return [ipaddress.ip_address(ip) for ip in ips]
-    except Exception:
-        return []
-
-def is_blocked_ip(ip: "ipaddress.IPv4Address | ipaddress.IPv6Address") -> bool:
-    # RFC1918, loopback, link-local, unique-local, multicast, unspecified + metadata ranges
-    private = ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_unspecified
-    # AWS/GCP metadata IPs
-    metadata_ips = {"169.254.169.254"}
-    return private or str(ip) in metadata_ips
-
-def validate_outbound_url(target_url: str) -> None:
-    from urllib.parse import urlparse
-    if not target_url or not target_url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="Invalid URL")
-    parsed = urlparse(target_url)
-    ips = _resolve_ip(parsed.hostname)
-    if not ips:
-        return
-    for ip in ips:
-        if is_blocked_ip(ip):
-            raise HTTPException(status_code=400, detail="Outbound to private/metadata addresses is blocked")
-
-def require_api_key(x_api_key: str | None) -> None:
-    required = os.getenv("API_KEY")
-    if not required:
-        # locked-down default: require key; if not set, block
-        raise HTTPException(status_code=503, detail="Server not configured: set API_KEY env var")
-    if x_api_key != required:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
 from datetime import datetime
 import base64
 import hashlib
@@ -718,15 +679,10 @@ async def get_http_client():
         timeout=timeout, 
         limits=limits,
         follow_redirects=True,
-        verify=True,
+        verify=False,
         http2=True  # HTTP/2サポート
     ) as client:
         yield client
-
-
-# Concurrency & limits
-_MAX_REQUESTS_PER_SCAN = int(os.getenv("MAX_REQUESTS_PER_SCAN", "200"))
-_concurrency_semaphore = asyncio.Semaphore(int(os.getenv("MAX_CONCURRENCY", "10")))
 
 # --- 高度な脆弱性検出ツール ---
 @tool
@@ -743,10 +699,6 @@ async def advanced_vulnerability_scanner(
     """
     if not url or not url.startswith(('http://', 'https://')):
         return "Error: Invalid URL format"
-    try:
-        validate_outbound_url(url)
-    except HTTPException as e:
-        return f"Blocked URL: {e.detail}"
     
     # 高度なWAFバイパス手法
     bypass_techniques = [
@@ -785,12 +737,10 @@ async def advanced_vulnerability_scanner(
         async with get_http_client() as client:
             # ベースライン取得
             try:
-                t0 = time.monotonic()
                 baseline_response = await client.request(method.upper(), url, data=data_dict, headers=headers or {})
-                t1 = time.monotonic()
                 baseline_status = baseline_response.status_code
                 baseline_length = len(baseline_response.text)
-                baseline_time = t1 - t0
+                baseline_time = baseline_response.elapsed.total_seconds()
             except Exception as e:
                 return f"Baseline request failed: {e}"
             
@@ -955,27 +905,27 @@ async def advanced_vulnerability_scanner(
             result_parts.append("")
             
             if bypass_successes:
-                result_parts.append("🔓 WAF BYPASSES SUCCESSFUL:")
+                result_parts.append("WAF BYPASSES SUCCESSFUL:")
                 for bypass in set(bypass_successes):
                     result_parts.append(f"  • {bypass}")
                 result_parts.append("")
             
             if vulnerabilities_found:
-                result_parts.append("🚨 VULNERABILITIES DETECTED:")
+                result_parts.append("VULNERABILITIES DETECTED:")
                 for vuln in set(vulnerabilities_found):
                     result_parts.append(f"  • {vuln}")
                 result_parts.append("")
                 
-                result_parts.append("📊 RESPONSE ANALYSIS:")
+                result_parts.append("RESPONSE ANALYSIS:")
                 for analysis in response_analysis[-3:]:  # 最新3件の分析データ
                     result_parts.append(f"  • {analysis}")
                 
                 # レスポンスサンプル（最初の2000文字、機密情報なし）
                 if len(response_text) > 0:
                     sample = response_text[:2000]
-                    result_parts.append(f"\n📄 RESPONSE SAMPLE:\n{sample}")
+                    result_parts.append(f"\nRESPONSE SAMPLE:\n{sample}")
             else:
-                result_parts.append("✅ No obvious vulnerabilities detected with current payloads")
+                result_parts.append("No obvious vulnerabilities detected with current payloads")
             
             return "\n".join(result_parts)
             
@@ -990,7 +940,7 @@ async def perform_comprehensive_scan(scan_input: "ScanInput") -> str:
     target_url = f"{scan_input.url.rstrip('/')}{scan_input.target_endpoint}"
     scan_start_time = time.time()
     
-    scan_log.append(f"🎯 COMPREHENSIVE BUG BOUNTY SCAN INITIATED")
+    scan_log.append(f"COMPREHENSIVE BUG BOUNTY SCAN INITIATED")
     scan_log.append(f"Target: {target_url}")
     scan_log.append(f"Vulnerability Types: {', '.join(scan_input.vulnerability_types)}")
     scan_log.append(f"Timestamp: {datetime.now().isoformat()}")
@@ -998,7 +948,7 @@ async def perform_comprehensive_scan(scan_input: "ScanInput") -> str:
     
     # 各脆弱性タイプに対して高度なスキャンを実行
     for vuln_type in scan_input.vulnerability_types:
-        scan_log.append(f"\n🔍 TESTING: {vuln_type.upper()}")
+        scan_log.append(f"\nTESTING: {vuln_type.upper()}")
         scan_log.append("-" * 50)
         
         try:
@@ -1013,10 +963,10 @@ async def perform_comprehensive_scan(scan_input: "ScanInput") -> str:
             scan_log.append(result)
             
         except Exception as e:
-            scan_log.append(f"❌ Error testing {vuln_type}: {str(e)}")
+            scan_log.append(f"Error testing {vuln_type}: {str(e)}")
     
     scan_duration = time.time() - scan_start_time
-    scan_log.append(f"\n⏱️  SCAN COMPLETED in {scan_duration:.2f} seconds")
+    scan_log.append(f"\nSCAN COMPLETED in {scan_duration:.2f} seconds")
     scan_log.append("=" * 80)
     
     return "\n".join(scan_log)
@@ -1025,7 +975,7 @@ async def perform_comprehensive_scan(scan_input: "ScanInput") -> str:
 async def run_comprehensive_scan_and_analyze(scan_input: "ScanInput"):
     """包括的なスキャンと分析を実行"""
     scan_id = f"comprehensive_scan_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}"
-    logger.info(f"[{scan_id}] 🚀 Advanced Bug Bounty Scan Started")
+    logger.info(f"[{scan_id}] Advanced Bug Bounty Scan Started")
     
     try:
         # 包括的スキャン実行
@@ -1172,12 +1122,32 @@ class ScanInput(BaseModel):
             raise ValueError(f'Invalid vulnerability types: {invalid_types}')
         return v
 
+# クイックスキャン用の新しいモデル
+class QuickScanInput(BaseModel):
+    url: str = Field(..., description="Target URL")
+    vulnerability_type: str = Field(..., description="Vulnerability type to test")
+    method: str = Field(default="POST", description="HTTP method")
+    data: str = Field(default='{"q": "test"}', description="Request data as JSON string")
+    
+    @validator('url')
+    def validate_url(cls, v):
+        if not v.startswith(('http://', 'https://')):
+            raise ValueError('URL must start with http:// or https://')
+        return v
+    
+    @validator('vulnerability_type')
+    def validate_vuln_type(cls, v):
+        allowed_types = ["xss", "sql_injection", "lfi", "rce", "ssti", "xxe", "nosql", "ssrf", "deserialization"]
+        if v not in allowed_types:
+            raise ValueError(f'Invalid vulnerability type: {v}. Must be one of: {allowed_types}')
+        return v
+
 # --- APIエンドポイント ---
 @router.post("/start_comprehensive_scan")
 async def start_comprehensive_scan(scan_input: ScanInput, background_tasks: BackgroundTasks):
     """包括的バグバウンティスキャンを開始"""
     try:
-        logger.info(f"🎯 Comprehensive scan request: {scan_input.url}{scan_input.target_endpoint}")
+        logger.info(f"Comprehensive scan request: {scan_input.url}{scan_input.target_endpoint}")
         background_tasks.add_task(run_comprehensive_scan_and_analyze, scan_input)
         
         return {
@@ -1200,29 +1170,21 @@ async def start_comprehensive_scan(scan_input: ScanInput, background_tasks: Back
         raise HTTPException(status_code=500, detail="Failed to start comprehensive vulnerability scan")
 
 @router.post("/quick_scan")
-async def quick_vulnerability_scan(
-    url: str = Field(..., description="Target URL"),
-    vulnerability_type: str = Field(..., description="Vulnerability type to test"),
-    method: str = Field(default="POST", description="HTTP method"),
-    data: str = Field(default='{"q": "test"}', description="Request data as JSON string")
-):
+async def quick_vulnerability_scan(scan_input: QuickScanInput):
     """クイック脆弱性スキャン - 単一の脆弱性タイプを即座にテスト"""
-    # Auth & URL guard
-    require_api_key(x_api_key)
-    validate_outbound_url(url)
     try:
         result = await advanced_vulnerability_scanner(
-            url=url,
-            method=method,
-            payload_type=vulnerability_type,
-            data=data,
+            url=scan_input.url,
+            method=scan_input.method,
+            payload_type=scan_input.vulnerability_type,
+            data=scan_input.data,
             advanced_mode=True
         )
         
         return {
             "status": "scan_completed",
-            "target": url,
-            "vulnerability_type": vulnerability_type,
+            "target": scan_input.url,
+            "vulnerability_type": scan_input.vulnerability_type,
             "results": result,
             "timestamp": datetime.now().isoformat()
         }
@@ -1259,7 +1221,7 @@ async def serve_advanced_frontend():
     <head>
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>🔥 Elite Bug Bounty Scanner v3.0</title>
+        <title>Elite Bug Bounty Scanner v3.0</title>
         <style>
             * {
                 margin: 0;
@@ -1582,7 +1544,7 @@ async def serve_advanced_frontend():
         
         <div class="container">
             <div class="header">
-                <h1>🔥 ELITE BUG BOUNTY SCANNER</h1>
+                <h1>ELITE BUG BOUNTY SCANNER</h1>
                 <p>Advanced Web Application Security Testing Platform v3.0</p>
                 
                 <div class="stats">
@@ -1606,7 +1568,7 @@ async def serve_advanced_frontend():
             </div>
             
             <div class="warning">
-                <strong>⚠️ AUTHORIZED TESTING ONLY</strong><br>
+                <strong>AUTHORIZED TESTING ONLY</strong><br>
                 This is a professional-grade penetration testing tool for authorized bug bounty hunting and security research.
                 Only use on systems you own or have explicit written permission to test.
                 Unauthorized use may violate laws and terms of service.
@@ -1616,26 +1578,26 @@ async def serve_advanced_frontend():
             <div class="scan-modes">
                 <!-- Comprehensive Scan Mode -->
                 <div class="scan-mode">
-                    <h3>🎯 COMPREHENSIVE SCAN</h3>
+                    <h3>COMPREHENSIVE SCAN</h3>
                     <p>Full-spectrum vulnerability assessment with advanced bypass techniques</p>
                     
                     <div class="form-group">
-                        <label for="comp_url">🌐 Target URL</label>
+                        <label for="comp_url">Target URL</label>
                         <input type="text" id="comp_url" value="https://target.com" placeholder="https://example.com">
                     </div>
                     
                     <div class="form-group">
-                        <label for="comp_endpoint">📍 Target Endpoint</label>
+                        <label for="comp_endpoint">Target Endpoint</label>
                         <input type="text" id="comp_endpoint" value="/search" placeholder="/login, /api/search, /upload">
                     </div>
                     
                     <div class="form-group">
-                        <label for="comp_tech">🔧 Tech Stack (Optional)</label>
+                        <label for="comp_tech">Tech Stack (Optional)</label>
                         <input type="text" id="comp_tech" placeholder="PHP 8.0, MySQL 8.0, Apache 2.4" value="">
                     </div>
                     
                     <div class="form-group">
-                        <label>🔍 Vulnerability Types</label>
+                        <label>Vulnerability Types</label>
                         <div class="vulnerability-grid" id="compVulnTypes">
                             <div class="vuln-checkbox" onclick="toggleVuln(this, 'xss')">
                                 <input type="checkbox" value="xss" checked>
@@ -1677,31 +1639,31 @@ async def serve_advanced_frontend():
                     </div>
                     
                     <div class="feature-list">
-                        <div class="feature">✅ 500+ Payloads</div>
-                        <div class="feature">✅ 12 WAF Bypasses</div>
-                        <div class="feature">✅ Multi-Parameter Testing</div>
-                        <div class="feature">✅ AI Analysis</div>
-                        <div class="feature">✅ Time-Based Detection</div>
-                        <div class="feature">✅ Error Analysis</div>
+                        <div class="feature">500+ Payloads</div>
+                        <div class="feature">12 WAF Bypasses</div>
+                        <div class="feature">Multi-Parameter Testing</div>
+                        <div class="feature">AI Analysis</div>
+                        <div class="feature">Time-Based Detection</div>
+                        <div class="feature">Error Analysis</div>
                     </div>
                     
                     <button class="action-button" onclick="startComprehensiveScan()" id="compScanBtn">
-                        🚀 LAUNCH COMPREHENSIVE SCAN
+                        LAUNCH COMPREHENSIVE SCAN
                     </button>
                 </div>
                 
                 <!-- Quick Scan Mode -->
                 <div class="scan-mode">
-                    <h3>⚡ QUICK SCAN</h3>
+                    <h3>QUICK SCAN</h3>
                     <p>Rapid single-vulnerability testing for immediate results</p>
                     
                     <div class="form-group">
-                        <label for="quick_url">🌐 Target URL</label>
+                        <label for="quick_url">Target URL</label>
                         <input type="text" id="quick_url" value="https://target.com/search" placeholder="https://example.com/endpoint">
                     </div>
                     
                     <div class="form-group">
-                        <label for="quick_vuln">🎯 Vulnerability Type</label>
+                        <label for="quick_vuln">Vulnerability Type</label>
                         <select id="quick_vuln">
                             <option value="xss">XSS - Cross-Site Scripting</option>
                             <option value="sql_injection">SQLi - SQL Injection</option>
@@ -1716,7 +1678,7 @@ async def serve_advanced_frontend():
                     </div>
                     
                     <div class="form-group">
-                        <label for="quick_method">📡 HTTP Method</label>
+                        <label for="quick_method">HTTP Method</label>
                         <select id="quick_method">
                             <option value="POST">POST</option>
                             <option value="GET">GET</option>
@@ -1726,19 +1688,19 @@ async def serve_advanced_frontend():
                     </div>
                     
                     <div class="form-group">
-                        <label for="quick_data">📦 Request Data (JSON)</label>
-                        <textarea id="quick_data" rows="3" placeholder='{"q": "test", "search": "query", "id": "1"}'>{&quot;q&quot;: &quot;test&quot;, &quot;search&quot;: &quot;query&quot;}</textarea>
+                        <label for="quick_data">Request Data (JSON)</label>
+                        <textarea id="quick_data" rows="3" placeholder='{"q": "test", "search": "query", "id": "1"}'>{"q": "test", "search": "query"}</textarea>
                     </div>
                     
                     <div class="feature-list">
-                        <div class="feature">⚡ Instant Results</div>
-                        <div class="feature">🎯 Focused Testing</div>
-                        <div class="feature">🔧 Custom Payloads</div>
-                        <div class="feature">📊 Detailed Response</div>
+                        <div class="feature">Instant Results</div>
+                        <div class="feature">Focused Testing</div>
+                        <div class="feature">Custom Payloads</div>
+                        <div class="feature">Detailed Response</div>
                     </div>
                     
                     <button class="action-button" onclick="startQuickScan()" id="quickScanBtn">
-                        ⚡ EXECUTE QUICK SCAN
+                        EXECUTE QUICK SCAN
                     </button>
                 </div>
             </div>
@@ -1817,12 +1779,12 @@ async def serve_advanced_frontend():
                 
                 // Validation
                 if (!url || !endpoint) {
-                    alert('❌ Target URL and endpoint are required');
+                    alert('Target URL and endpoint are required');
                     return;
                 }
                 
                 if (!url.startsWith('http://') && !url.startsWith('https://')) {
-                    alert('❌ URL must start with http:// or https://');
+                    alert('URL must start with http:// or https://');
                     return;
                 }
                 
@@ -1831,12 +1793,12 @@ async def serve_advanced_frontend():
                     .map(cb => cb.value);
                 
                 if (selectedVulns.length === 0) {
-                    alert('❌ Please select at least one vulnerability type');
+                    alert('Please select at least one vulnerability type');
                     return;
                 }
                 
                 // Confirm scan
-                const confirmMessage = `🎯 COMPREHENSIVE BUG BOUNTY SCAN\\n\\nTarget: ${url}${endpoint}\\nVulnerability Types: ${selectedVulns.join(', ')}\\n\\n⚠️  ENSURE YOU HAVE AUTHORIZATION TO TEST THIS TARGET\\n\\nThis will execute 500+ payloads with advanced bypass techniques.\\nContinue?`;
+                const confirmMessage = `COMPREHENSIVE BUG BOUNTY SCAN\\n\\nTarget: ${url}${endpoint}\\nVulnerability Types: ${selectedVulns.join(', ')}\\n\\nENSURE YOU HAVE AUTHORIZATION TO TEST THIS TARGET\\n\\nThis will execute 500+ payloads with advanced bypass techniques.\\nContinue?`;
                 if (!confirm(confirmMessage)) {
                     return;
                 }
@@ -1845,7 +1807,7 @@ async def serve_advanced_frontend():
                 button.disabled = true;
                 button.innerHTML = '<span class="loading"></span>COMPREHENSIVE SCAN IN PROGRESS...';
                 output.style.display = 'block';
-                output.innerHTML = '<div class="status info">🔥 Initializing comprehensive vulnerability scan with advanced techniques...</div>';
+                output.innerHTML = '<div class="status info">Initializing comprehensive vulnerability scan with advanced techniques...</div>';
                 
                 // Parse tech stack
                 const techStackArray = techStack ? techStack.split(',').map(item => {
@@ -1880,17 +1842,17 @@ async def serve_advanced_frontend():
                     
                     if (result.status === 'comprehensive_scan_initiated') {
                         output.innerHTML = `
-                            <div class="status success">✅ ${result.message}</div>
+                            <div class="status success">SCAN INITIATED</div>
                             
-                            <strong>🎯 COMPREHENSIVE SCAN INITIATED</strong>
+                            <strong>COMPREHENSIVE SCAN INITIATED</strong>
                             • Target: ${result.target}
                             • Vulnerability Types: ${result.vulnerability_types.join(', ')}
                             • Started: ${new Date(result.timestamp).toLocaleString()}
                             
-                            <strong>🔥 ADVANCED FEATURES ACTIVATED:</strong>
+                            <strong>ADVANCED FEATURES ACTIVATED:</strong>
                             ${result.features.map(feature => `• ${feature}`).join('\\n')}
                             
-                            <strong>📊 SCAN DETAILS:</strong>
+                            <strong>SCAN DETAILS:</strong>
                             • 500+ attack payloads will be tested
                             • 12 WAF bypass techniques applied
                             • Multiple parameter names tested per payload
@@ -1898,30 +1860,30 @@ async def serve_advanced_frontend():
                             • Error-based detection with pattern matching
                             • AI-powered vulnerability analysis and reporting
                             
-                            <strong>📋 MONITORING:</strong>
+                            <strong>MONITORING:</strong>
                             • Real-time results logged to server console
                             • Look for "VULNERABILITIES DETECTED" messages
                             • Advanced LLM analysis will provide detailed reports
                             • CVSS scoring and exploitation guidance included
                             
-                            <strong>🎯 BUG BOUNTY OPTIMIZATION:</strong>
+                            <strong>BUG BOUNTY OPTIMIZATION:</strong>
                             • Results optimized for bug bounty platforms
                             • Detailed proof-of-concept recommendations
                             • Business impact assessment included
                             • Remediation guidance provided
                             
-                            <em>⚡ This scan uses elite-level penetration testing techniques with comprehensive payload sets and advanced bypass methods specifically designed for professional bug bounty hunting.</em>
+                            <em>This scan uses elite-level penetration testing techniques with comprehensive payload sets and advanced bypass methods specifically designed for professional bug bounty hunting.</em>
                         `;
                     } else {
-                        output.innerHTML = `<div class="status error">❌ Unexpected response: ${JSON.stringify(result)}</div>`;
+                        output.innerHTML = `<div class="status error">Unexpected response: ${JSON.stringify(result)}</div>`;
                     }
                     
                 } catch (error) {
                     console.error('Comprehensive scan error:', error);
-                    output.innerHTML = `<div class="status error">❌ Comprehensive scan failed: ${error.message}</div>`;
+                    output.innerHTML = `<div class="status error">Comprehensive scan failed: ${error.message}</div>`;
                 } finally {
                     button.disabled = false;
-                    button.innerHTML = '🚀 LAUNCH COMPREHENSIVE SCAN';
+                    button.innerHTML = 'LAUNCH COMPREHENSIVE SCAN';
                 }
             }
             
@@ -1936,12 +1898,12 @@ async def serve_advanced_frontend():
                 
                 // Validation
                 if (!url) {
-                    alert('❌ Target URL is required');
+                    alert('Target URL is required');
                     return;
                 }
                 
                 if (!url.startsWith('http://') && !url.startsWith('https://')) {
-                    alert('❌ URL must start with http:// or https://');
+                    alert('URL must start with http:// or https://');
                     return;
                 }
                 
@@ -1949,7 +1911,7 @@ async def serve_advanced_frontend():
                 try {
                     JSON.parse(data);
                 } catch (e) {
-                    alert('❌ Request data must be valid JSON');
+                    alert('Request data must be valid JSON');
                     return;
                 }
                 
@@ -1957,15 +1919,16 @@ async def serve_advanced_frontend():
                 button.disabled = true;
                 button.innerHTML = '<span class="loading"></span>EXECUTING QUICK SCAN...';
                 output.style.display = 'block';
-                output.innerHTML = '<div class="status info">⚡ Executing quick vulnerability scan...</div>';
+                output.innerHTML = '<div class="status info">Executing quick vulnerability scan...</div>';
                 
                 try {
                     const response = await fetch('/quick_scan', {
                         method: 'POST',
                         headers: { 
-                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'Content-Type': 'application/json',
+                            'Accept': 'application/json'
                         },
-                        body: new URLSearchParams({
+                        body: JSON.stringify({
                             url: url,
                             vulnerability_type: vulnType,
                             method: method,
@@ -1981,26 +1944,26 @@ async def serve_advanced_frontend():
                     
                     if (result.status === 'scan_completed') {
                         output.innerHTML = `
-                            <div class="status success">✅ Quick scan completed</div>
+                            <div class="status success">Quick scan completed</div>
                             
-                            <strong>🎯 QUICK SCAN RESULTS</strong>
+                            <strong>QUICK SCAN RESULTS</strong>
                             • Target: ${result.target}
                             • Vulnerability Type: ${result.vulnerability_type.toUpperCase()}
                             • Completed: ${new Date(result.timestamp).toLocaleString()}
                             
-                            <strong>📊 DETAILED RESULTS:</strong>
+                            <strong>DETAILED RESULTS:</strong>
                             ${result.results}
                         `;
                     } else {
-                        output.innerHTML = `<div class="status error">❌ Unexpected response: ${JSON.stringify(result)}</div>`;
+                        output.innerHTML = `<div class="status error">Unexpected response: ${JSON.stringify(result)}</div>`;
                     }
                     
                 } catch (error) {
                     console.error('Quick scan error:', error);
-                    output.innerHTML = `<div class="status error">❌ Quick scan failed: ${error.message}</div>`;
+                    output.innerHTML = `<div class="status error">Quick scan failed: ${error.message}</div>`;
                 } finally {
                     button.disabled = false;
-                    button.innerHTML = '⚡ EXECUTE QUICK SCAN';
+                    button.innerHTML = 'EXECUTE QUICK SCAN';
                 }
             }
             
@@ -2038,10 +2001,10 @@ app.include_router(router)
 # --- メイン実行部分 ---
 if __name__ == "__main__":
     try:
-        logger.info(f"🔥 Elite Bug Bounty Scanner v3.0 starting on {config.host}:{config.port}")
-        logger.info(f"🎯 Features: Advanced payloads, WAF bypass, comprehensive testing")
-        logger.info(f"🤖 LLM Analysis: {'Enabled' if config.google_api_key else 'Disabled (set GOOGLE_API_KEY to enable)'}")
-        logger.info(f"🚀 Ready for professional bug bounty hunting!")
+        logger.info(f"Elite Bug Bounty Scanner v3.0 starting on {config.host}:{config.port}")
+        logger.info(f"Features: Advanced payloads, WAF bypass, comprehensive testing")
+        logger.info(f"LLM Analysis: {'Enabled' if config.google_api_key else 'Disabled (set GOOGLE_API_KEY to enable)'}")
+        logger.info(f"Ready for professional bug bounty hunting!")
         
         uvicorn.run(
             app, 
